@@ -1,0 +1,563 @@
+From 0b5bcd66f3bdb7dedcfb918a06c6437f6fb5e1c6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Christian=20Gr=C3=BCnhage?=
+ <jan.christian@gruenhage.xyz>
+Date: Wed, 22 Feb 2023 21:43:25 +0100
+Subject: [PATCH 3/4] Allow specifying what subkeys to generate for user
+ certificates
+
+---
+ openpgp-ca-bin/src/bin.rs          |  6 +++
+ openpgp-ca-bin/src/cli.rs          | 24 ++++++++++
+ openpgp-ca-lib/src/cert.rs         | 15 +++++-
+ openpgp-ca-lib/src/lib.rs          |  9 ++++
+ openpgp-ca-lib/src/pgp.rs          | 21 +++++++--
+ openpgp-ca-lib/tests/card.rs       | 12 +++++
+ openpgp-ca-lib/tests/test_gpg.rs   | 75 ++++++++++++++++++++++++++++--
+ openpgp-ca-lib/tests/test_oca.rs   | 39 ++++++++++++++++
+ openpgp-ca-lib/tests/test_split.rs |  2 +-
+ openpgp-ca-lib/tests/wkd.rs        | 24 +++++++++-
+ 10 files changed, 214 insertions(+), 13 deletions(-)
+
+diff --git a/openpgp-ca-bin/src/bin.rs b/openpgp-ca-bin/src/bin.rs
+index 0c1e04f..eb833ae 100644
+--- a/openpgp-ca-bin/src/bin.rs
++++ b/openpgp-ca-bin/src/bin.rs
+@@ -231,6 +231,9 @@ fn main() -> Result<()> {
+                 name,
+                 minimal,
+                 cipher_suite,
++                enable_encryption_subkey,
++                enable_signing_subkey,
++                enable_authentication_subkey,
+             } => {
+                 // TODO: key-profile?
+ 
+@@ -243,6 +246,9 @@ fn main() -> Result<()> {
+                     true,
+                     minimal,
+                     cipher_suite,
++                    enable_encryption_subkey,
++                    enable_signing_subkey,
++                    enable_authentication_subkey,
+                 )?;
+             }
+             cli::UserCommand::AddRevocation { revocation_file } => {
+diff --git a/openpgp-ca-bin/src/cli.rs b/openpgp-ca-bin/src/cli.rs
+index acb851e..5aac8a8 100644
+--- a/openpgp-ca-bin/src/cli.rs
++++ b/openpgp-ca-bin/src/cli.rs
+@@ -260,6 +260,30 @@ pub enum UserCommand {
+ 
+         #[clap(long = "cipher-suite", help = "Set cipher suite")]
+         cipher_suite: Option<CipherSuite>,
++
++        #[clap(
++            long = "encryption",
++            help = "Enable creating an encryption subkey",
++            default_value_t = true,
++            action = clap::ArgAction::Set,
++        )]
++        enable_encryption_subkey: bool,
++
++        #[clap(
++            long = "signing",
++            help = "Enable creating an signing subkey",
++            default_value_t = true,
++            action = clap::ArgAction::Set,
++        )]
++        enable_signing_subkey: bool,
++
++        #[clap(
++            long = "authentication",
++            help = "Enable creating an authentication subkey",
++            default_value_t = false,
++            action = clap::ArgAction::Set,
++        )]
++        enable_authentication_subkey: bool,
+     },
+ 
+     /// Add Revocation Certificate
+diff --git a/openpgp-ca-lib/src/cert.rs b/openpgp-ca-lib/src/cert.rs
+index f3f6046..50e7366 100644
+--- a/openpgp-ca-lib/src/cert.rs
++++ b/openpgp-ca-lib/src/cert.rs
+@@ -27,10 +27,21 @@ pub fn user_new(
+     password: bool,
+     output_format_minimal: bool,
+     cipher_suite: Option<CipherSuite>,
++    enable_encryption_subkey: bool,
++    enable_signing_subkey: bool,
++    enable_authentication_subkey: bool,
+ ) -> Result<()> {
+     // Generate new user key
+-    let (user_key, user_revoc, pass) = pgp::make_user_cert(emails, name, password, cipher_suite)
+-        .context("make_user_cert failed")?;
++    let (user_key, user_revoc, pass) = pgp::make_user_cert(
++        emails,
++        name,
++        password,
++        cipher_suite,
++        enable_encryption_subkey,
++        enable_signing_subkey,
++        enable_authentication_subkey,
++    )
++    .context("make_user_cert failed")?;
+ 
+     // -- CA secret operation --
+     // CA certifies user cert
+diff --git a/openpgp-ca-lib/src/lib.rs b/openpgp-ca-lib/src/lib.rs
+index 1a6ec01..101ce27 100644
+--- a/openpgp-ca-lib/src/lib.rs
++++ b/openpgp-ca-lib/src/lib.rs
+@@ -37,6 +37,9 @@
+ //!     false,
+ //!     false,
+ //!     None,
++//!     true,
++//!     true,
++//!     false,
+ //! )
+ //! .unwrap();
+ //! ```
+@@ -932,6 +935,9 @@ impl Oca {
+         password: bool,
+         output_format_minimal: bool,
+         cipher_suite: Option<CipherSuite>,
++        enable_encryption_subkey: bool,
++        enable_signing_subkey: bool,
++        enable_authentication_subkey: bool,
+     ) -> Result<()> {
+         // storage: ca_import_tsig + user_add
+ 
+@@ -943,6 +949,9 @@ impl Oca {
+             password,
+             output_format_minimal,
+             cipher_suite,
++            enable_encryption_subkey,
++            enable_signing_subkey,
++            enable_authentication_subkey,
+         )
+     }
+ 
+diff --git a/openpgp-ca-lib/src/pgp.rs b/openpgp-ca-lib/src/pgp.rs
+index 653c98a..dd992fb 100644
+--- a/openpgp-ca-lib/src/pgp.rs
++++ b/openpgp-ca-lib/src/pgp.rs
+@@ -174,19 +174,32 @@ pub(crate) fn make_user_cert(
+     name: Option<&str>,
+     password: bool,
+     cipher_suite: Option<CipherSuite>,
++    enable_encryption_subkey: bool,
++    enable_signing_subkey: bool,
++    enable_authentication_subkey: bool,
+ ) -> Result<(Cert, Signature, Option<String>)> {
+     let pass = if password { Some(diceware()) } else { None };
+ 
+     let mut builder = cert::CertBuilder::new()
+-        .set_cipher_suite(cipher_suite.unwrap_or(CipherSuite::RSA4k).into())
+-        .add_subkey(
++        .set_cipher_suite(cipher_suite.unwrap_or(CipherSuite::RSA4k).into());
++
++    if enable_encryption_subkey {
++        builder = builder.add_subkey(
+             KeyFlags::empty()
+                 .set_transport_encryption()
+                 .set_storage_encryption(),
+             None,
+             None,
+-        )
+-        .add_signing_subkey();
++        );
++    }
++
++    if enable_signing_subkey {
++        builder = builder.add_signing_subkey();
++    }
++
++    if enable_authentication_subkey {
++        builder = builder.add_authentication_subkey();
++    }
+ 
+     if let Some(pass) = &pass {
+         builder = builder.set_password(Some(pass.to_owned().into()));
+diff --git a/openpgp-ca-lib/tests/card.rs b/openpgp-ca-lib/tests/card.rs
+index b6123a6..e1a9d01 100644
+--- a/openpgp-ca-lib/tests/card.rs
++++ b/openpgp-ca-lib/tests/card.rs
+@@ -36,6 +36,9 @@ fn init_on_card() -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -98,6 +101,9 @@ fn init_card_import_key() -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -172,6 +178,9 @@ fn init_card_import_card() -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -226,6 +235,9 @@ fn card_import_migrate() -> Result<()> {
+             false,
+             false,
+             None,
++            true,
++            true,
++            false,
+         )?;
+     }
+ 
+diff --git a/openpgp-ca-lib/tests/test_gpg.rs b/openpgp-ca-lib/tests/test_gpg.rs
+index cb51a2f..b729360 100644
+--- a/openpgp-ca-lib/tests/test_gpg.rs
++++ b/openpgp-ca-lib/tests/test_gpg.rs
+@@ -56,8 +56,21 @@ fn test_alice_authenticates_bob_centralized(gpg: Ctx, ca: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
++    )?;
++    ca.user_new(
++        Some("Bob"),
++        &["bob@example.org"],
++        None,
++        false,
++        false,
++        None,
++        true,
++        true,
++        false,
+     )?;
+-    ca.user_new(Some("Bob"), &["bob@example.org"], None, false, false, None)?;
+ 
+     // ---- import keys from OpenPGP CA into GnuPG ----
+ 
+@@ -282,13 +295,33 @@ fn test_bridge(gpg: Ctx, ca1: Oca, ca2: Oca) -> Result<()> {
+ 
+     // make CA user
+     assert!(ca1
+-        .user_new(Some("Alice"), &["alice@some.org"], None, false, false, None,)
++        .user_new(
++            Some("Alice"),
++            &["alice@some.org"],
++            None,
++            false,
++            false,
++            None,
++            true,
++            true,
++            false
++        )
+         .is_ok());
+ 
+     // ---- populate second OpenPGP CA instance ----
+ 
+     // make CA user
+-    ca2.user_new(Some("Bob"), &["bob@other.org"], None, false, false, None)?;
++    ca2.user_new(
++        Some("Bob"),
++        &["bob@other.org"],
++        None,
++        false,
++        false,
++        None,
++        true,
++        true,
++        false,
++    )?;
+ 
+     // make CA user that is out of the domain scope for ca2
+     ca2.user_new(
+@@ -298,6 +331,9 @@ fn test_bridge(gpg: Ctx, ca1: Oca, ca2: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     // ---- setup bridges: scoped trust between one.org and two.org ---
+@@ -441,6 +477,9 @@ fn test_multi_bridge(gpg: Ctx, ca1: Oca, ca2: Oca, ca3: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     ca3.user_new(
+@@ -450,8 +489,21 @@ fn test_multi_bridge(gpg: Ctx, ca1: Oca, ca2: Oca, ca3: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
++    )?;
++    ca3.user_new(
++        Some("Bob"),
++        &["bob@beta.org"],
++        None,
++        false,
++        false,
++        None,
++        true,
++        true,
++        false,
+     )?;
+-    ca3.user_new(Some("Bob"), &["bob@beta.org"], None, false, false, None)?;
+ 
+     // ---- set up bridges: scoped trust between alpha<->beta and beta<->gamma ---
+     let home_path = String::from(gpg.get_homedir().to_str().unwrap());
+@@ -596,9 +648,22 @@ fn test_scoping(gpg: Ctx, ca1: Oca, ca2: Oca, ca3: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+-    ca3.user_new(Some("Bob"), &["bob@beta.org"], None, false, false, None)?;
++    ca3.user_new(
++        Some("Bob"),
++        &["bob@beta.org"],
++        None,
++        false,
++        false,
++        None,
++        true,
++        true,
++        false,
++    )?;
+     let ca3_file = format!("{home_path}/ca3.pubkey");
+     let pub_ca3 = ca3.ca_get_pubkey_armored()?;
+     std::fs::write(&ca3_file, pub_ca3).expect("Unable to write file");
+diff --git a/openpgp-ca-lib/tests/test_oca.rs b/openpgp-ca-lib/tests/test_oca.rs
+index e9e4f04..6b3ba3f 100644
+--- a/openpgp-ca-lib/tests/test_oca.rs
++++ b/openpgp-ca-lib/tests/test_oca.rs
+@@ -66,6 +66,9 @@ fn test_ca(ca: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -141,6 +144,9 @@ fn test_expiring_certification(ca: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -397,6 +403,9 @@ fn test_ca_insert_duplicate_email(ca: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     // make another CA user with the same email address
+@@ -407,6 +416,9 @@ fn test_ca_insert_duplicate_email(ca: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -565,6 +577,9 @@ fn test_ca_signatures(gpg: Ctx, ca: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     for user in ca.users_get_all()? {
+@@ -632,6 +647,9 @@ fn test_apply_revocation(ca: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -776,6 +794,9 @@ fn test_revocation_no_fingerprint(gpg: Ctx, ca: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     // gpg: make key for Bob
+@@ -920,6 +941,9 @@ fn test_create_user_with_pw(ca: Oca) -> Result<()> {
+         true,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -973,6 +997,9 @@ fn test_refresh(ca: Oca) -> Result<()> {
+         true,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+     ca.user_new(
+         Some("Bob"),
+@@ -981,6 +1008,9 @@ fn test_refresh(ca: Oca) -> Result<()> {
+         true,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+     ca.user_new(
+         Some("Carol"),
+@@ -989,6 +1019,9 @@ fn test_refresh(ca: Oca) -> Result<()> {
+         true,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+     ca.user_new(
+         Some("Dave"),
+@@ -997,6 +1030,9 @@ fn test_refresh(ca: Oca) -> Result<()> {
+         true,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     // set dave to "inactive"
+@@ -1095,6 +1131,9 @@ fn test_ca_re_certify(gpg: Ctx, ca1: Oca) -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let (bob, _rev) = CertBuilder::new()
+diff --git a/openpgp-ca-lib/tests/test_split.rs b/openpgp-ca-lib/tests/test_split.rs
+index a34d100..5f55bb6 100644
+--- a/openpgp-ca-lib/tests/test_split.rs
++++ b/openpgp-ca-lib/tests/test_split.rs
+@@ -65,7 +65,7 @@ fn split_certify(ca: Oca) -> Result<()> {
+     let back = Oca::open(back_path.to_str())?;
+ 
+     // Make user on online ca
+-    front.user_new(Some("Alice"), &["alice@example.org"], None, false, false, None)?;
++    front.user_new(Some("Alice"), &["alice@example.org"], None, false, false, None, true, true, false)?;
+ 
+     let certs = front.user_certs_get_all()?;
+     assert_eq!(certs.len(), 1);
+diff --git a/openpgp-ca-lib/tests/wkd.rs b/openpgp-ca-lib/tests/wkd.rs
+index bc28a79..6dc3e56 100644
+--- a/openpgp-ca-lib/tests/wkd.rs
++++ b/openpgp-ca-lib/tests/wkd.rs
+@@ -41,6 +41,9 @@ fn test_ca_export_wkd() -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+     ca.user_new(
+         Some("Bob"),
+@@ -49,6 +52,9 @@ fn test_ca_export_wkd() -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+     ca.user_new(
+         Some("Carol"),
+@@ -57,6 +63,9 @@ fn test_ca_export_wkd() -> Result<()> {
+         false,
+         false,
+         None,
++        true,
++        true,
++        false,
+     )?;
+ 
+     let wkd_dir = home_path + "/wkd/";
+@@ -120,8 +129,21 @@ fn test_wkd_delist() -> Result<()> {
+         true,
+         false,
+         None,
++        true,
++        true,
++        false,
++    )?;
++    ca.user_new(
++        Some("Bob"),
++        &["bob@example.org"],
++        None,
++        true,
++        false,
++        None,
++        true,
++        true,
++        false,
+     )?;
+-    ca.user_new(Some("Bob"), &["bob@example.org"], None, true, false, None)?;
+ 
+     // set bob to "delisted"
+     let cert = ca.certs_by_email("bob@example.org")?;
+-- 
+2.43.0
+

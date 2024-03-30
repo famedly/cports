@@ -1,0 +1,643 @@
+From ea52112a8424b306ccf3b9ebee4c8a4ecb220bfe Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Christian=20Gr=C3=BCnhage?=
+ <jan.christian@gruenhage.xyz>
+Date: Wed, 22 Feb 2023 21:36:53 +0100
+Subject: [PATCH 1/4] Allow overriding cipher suite for user keys
+
+---
+ openpgp-ca-bin/src/bin.rs          |  10 ++-
+ openpgp-ca-bin/src/cli.rs          |   4 ++
+ openpgp-ca-lib/src/cert.rs         |   7 +-
+ openpgp-ca-lib/src/lib.rs          |  14 +++-
+ openpgp-ca-lib/src/pgp.rs          |  50 ++++++++++++-
+ openpgp-ca-lib/tests/card.rs       |  36 ++++++++--
+ openpgp-ca-lib/tests/test_gpg.rs   |  55 ++++++++++++---
+ openpgp-ca-lib/tests/test_oca.rs   | 109 +++++++++++++++++++++++++----
+ openpgp-ca-lib/tests/test_split.rs |   2 +-
+ openpgp-ca-lib/tests/wkd.rs        |  30 ++++++--
+ 10 files changed, 277 insertions(+), 40 deletions(-)
+
+diff --git a/openpgp-ca-bin/src/bin.rs b/openpgp-ca-bin/src/bin.rs
+index e1e08e1..d26f648 100644
+--- a/openpgp-ca-bin/src/bin.rs
++++ b/openpgp-ca-bin/src/bin.rs
+@@ -223,12 +223,20 @@ fn main() -> Result<()> {
+                 email,
+                 name,
+                 minimal,
++                cipher_suite,
+             } => {
+                 // TODO: key-profile?
+ 
+                 let emails: Vec<_> = email.iter().map(String::as_str).collect();
+ 
+-                ca.user_new(name.as_deref(), &emails[..], None, true, minimal)?;
++                ca.user_new(
++                    name.as_deref(),
++                    &emails[..],
++                    None,
++                    true,
++                    minimal,
++                    cipher_suite,
++                )?;
+             }
+             cli::UserCommand::AddRevocation { revocation_file } => {
+                 ca.revocation_add_from_file(&revocation_file)?
+diff --git a/openpgp-ca-bin/src/cli.rs b/openpgp-ca-bin/src/cli.rs
+index 99be3c4..2bcf648 100644
+--- a/openpgp-ca-bin/src/cli.rs
++++ b/openpgp-ca-bin/src/cli.rs
+@@ -7,6 +7,7 @@
+ use std::path::PathBuf;
+ 
+ use clap::{Parser, Subcommand};
++use openpgp_ca_lib::pgp::CipherSuite;
+ 
+ #[derive(Parser)]
+ #[clap(
+@@ -253,6 +254,9 @@ pub enum UserCommand {
+             help = "Minimal output (for consumption by tools such as 'pass')"
+         )]
+         minimal: bool,
++
++        #[clap(long = "cipher-suite", help = "Set cipher suite")]
++        cipher_suite: Option<CipherSuite>,
+     },
+ 
+     /// Add Revocation Certificate
+diff --git a/openpgp-ca-lib/src/cert.rs b/openpgp-ca-lib/src/cert.rs
+index 8c044a9..f3f6046 100644
+--- a/openpgp-ca-lib/src/cert.rs
++++ b/openpgp-ca-lib/src/cert.rs
+@@ -14,7 +14,7 @@ use sequoia_openpgp::serialize::SerializeInto;
+ use sequoia_openpgp::Cert;
+ 
+ use crate::db::models;
+-use crate::pgp;
++use crate::pgp::{self, CipherSuite};
+ use crate::secret::CaSec;
+ use crate::types::CertificationStatus;
+ use crate::Oca;
+@@ -26,10 +26,11 @@ pub fn user_new(
+     duration_days: Option<u64>,
+     password: bool,
+     output_format_minimal: bool,
++    cipher_suite: Option<CipherSuite>,
+ ) -> Result<()> {
+     // Generate new user key
+-    let (user_key, user_revoc, pass) =
+-        pgp::make_user_cert(emails, name, password).context("make_user_cert failed")?;
++    let (user_key, user_revoc, pass) = pgp::make_user_cert(emails, name, password, cipher_suite)
++        .context("make_user_cert failed")?;
+ 
+     // -- CA secret operation --
+     // CA certifies user cert
+diff --git a/openpgp-ca-lib/src/lib.rs b/openpgp-ca-lib/src/lib.rs
+index b94f012..cbf5bfe 100644
+--- a/openpgp-ca-lib/src/lib.rs
++++ b/openpgp-ca-lib/src/lib.rs
+@@ -30,8 +30,15 @@
+ //! //
+ //! // The new private key for the user is printed to stdout and needs to be manually
+ //! // processed from there.
+-//! ca.user_new(Some(&"Alice"), &["alice@example.org"], None, false, false)
+-//!     .unwrap();
++//! ca.user_new(
++//!     Some(&"Alice"),
++//!     &["alice@example.org"],
++//!     None,
++//!     false,
++//!     false,
++//!     None,
++//! )
++//! .unwrap();
+ //! ```
+ 
+ #[macro_use]
+@@ -79,6 +86,7 @@ use crate::backend::{card, split, Backend};
+ use crate::db::models;
+ use crate::db::models::NewCacert;
+ use crate::db::OcaDb;
++use crate::pgp::CipherSuite;
+ use crate::secret::{CaSec, CaSecCB};
+ use crate::storage::{CaStorageRW, DbCa, UninitDb};
+ use crate::types::CertificationStatus;
+@@ -917,6 +925,7 @@ impl Oca {
+         duration_days: Option<u64>,
+         password: bool,
+         output_format_minimal: bool,
++        cipher_suite: Option<CipherSuite>,
+     ) -> Result<()> {
+         // storage: ca_import_tsig + user_add
+ 
+@@ -927,6 +936,7 @@ impl Oca {
+             duration_days,
+             password,
+             output_format_minimal,
++            cipher_suite,
+         )
+     }
+ 
+diff --git a/openpgp-ca-lib/src/pgp.rs b/openpgp-ca-lib/src/pgp.rs
+index edf1b64..3de6426 100644
+--- a/openpgp-ca-lib/src/pgp.rs
++++ b/openpgp-ca-lib/src/pgp.rs
+@@ -7,6 +7,7 @@
+ //! PGP helper functions.
+ 
+ use std::convert::TryInto;
++use std::str::FromStr;
+ use std::time::SystemTime;
+ 
+ use anyhow::{Context, Result};
+@@ -16,7 +17,7 @@ use sequoia_openpgp::cert;
+ use sequoia_openpgp::cert::amalgamation::key::ValidKeyAmalgamation;
+ use sequoia_openpgp::cert::amalgamation::{ValidAmalgamation, ValidateAmalgamation};
+ use sequoia_openpgp::cert::prelude::ComponentAmalgamation;
+-use sequoia_openpgp::cert::{CertParser, CipherSuite};
++use sequoia_openpgp::cert::{CertParser, CipherSuite as SeqCipherSuite};
+ use sequoia_openpgp::crypto::KeyPair;
+ use sequoia_openpgp::packet::signature::SignatureBuilder;
+ use sequoia_openpgp::packet::{signature, Signature, UserID};
+@@ -88,7 +89,7 @@ pub(crate) fn make_ca_cert(domain: &str, name: Option<&str>) -> Result<(Cert, Si
+     let (mut ca_key, revocation) = cert::CertBuilder::new()
+         // RHEL7 [eol 2026] is shipped with GnuPG 2.0.x, which doesn't
+         // support ECC
+-        .set_cipher_suite(CipherSuite::RSA4k)
++        .set_cipher_suite(CipherSuite::RSA4k.into())
+         .add_signing_subkey()
+         // FIXME: set expiration from CLI
+         // .set_validity_period()
+@@ -168,11 +169,12 @@ pub(crate) fn make_user_cert(
+     emails: &[&str],
+     name: Option<&str>,
+     password: bool,
++    cipher_suite: Option<CipherSuite>,
+ ) -> Result<(Cert, Signature, Option<String>)> {
+     let pass = if password { Some(diceware()) } else { None };
+ 
+     let mut builder = cert::CertBuilder::new()
+-        .set_cipher_suite(CipherSuite::RSA4k)
++        .set_cipher_suite(cipher_suite.unwrap_or(CipherSuite::RSA4k).into())
+         .add_subkey(
+             KeyFlags::empty()
+                 .set_transport_encryption()
+@@ -511,3 +513,45 @@ pub fn valid_certifications_by(
+         .cloned()
+         .collect()
+ }
++
++#[derive(Clone)]
++pub enum CipherSuite {
++    Cv25519,
++    RSA3k,
++    P256,
++    P384,
++    P521,
++    RSA2k,
++    RSA4k,
++}
++
++impl From<CipherSuite> for SeqCipherSuite {
++    fn from(value: CipherSuite) -> Self {
++        match value {
++            CipherSuite::Cv25519 => SeqCipherSuite::Cv25519,
++            CipherSuite::RSA3k => SeqCipherSuite::RSA3k,
++            CipherSuite::P256 => SeqCipherSuite::P256,
++            CipherSuite::P384 => SeqCipherSuite::P384,
++            CipherSuite::P521 => SeqCipherSuite::P521,
++            CipherSuite::RSA2k => SeqCipherSuite::RSA2k,
++            CipherSuite::RSA4k => SeqCipherSuite::RSA4k,
++        }
++    }
++}
++
++impl FromStr for CipherSuite {
++    type Err = &'static str;
++
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        Ok(match s.to_lowercase().as_str() {
++            "cv25519" => CipherSuite::Cv25519,
++            "rsa3k" => CipherSuite::RSA3k,
++            "p256" => CipherSuite::P256,
++            "p384" => CipherSuite::P384,
++            "p521" => CipherSuite::P521,
++            "rsa2k" => CipherSuite::RSA2k,
++            "rsa4k" => CipherSuite::RSA4k,
++            _ => return Err("Unknown cipher suite"),
++        })
++    }
++}
+diff --git a/openpgp-ca-lib/tests/card.rs b/openpgp-ca-lib/tests/card.rs
+index eab6352..d7db0a7 100644
+--- a/openpgp-ca-lib/tests/card.rs
++++ b/openpgp-ca-lib/tests/card.rs
+@@ -29,7 +29,14 @@ fn init_on_card() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+     let ca = cau.init_card_generate_on_card(&ident, "example.org", None, None)?;
+ 
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+     assert_eq!(certs.len(), 1);
+@@ -84,7 +91,14 @@ fn init_card_import_key() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+     let ca = cau.init_card_import_key(&ident, "example.org", ca_private.as_bytes())?;
+ 
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+     assert_eq!(certs.len(), 1);
+@@ -150,7 +164,14 @@ fn init_card_import_card() -> Result<()> {
+         pgp::cert_to_armored(&ca_pub)?.as_bytes(),
+     )?;
+ 
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+     assert_eq!(certs.len(), 1);
+@@ -197,7 +218,14 @@ fn card_import_migrate() -> Result<()> {
+         let cau_old = Uninit::new(ca_path.to_str())?;
+         let ca_old = cau_old.init_softkey("example.org", None)?;
+ 
+-        ca_old.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++        ca_old.user_new(
++            Some("Alice"),
++            &["alice@example.org"],
++            None,
++            false,
++            false,
++            None,
++        )?;
+     }
+ 
+     // Migrate the softkey instance to a card-backed one
+diff --git a/openpgp-ca-lib/tests/test_gpg.rs b/openpgp-ca-lib/tests/test_gpg.rs
+index 832d1ab..471aa3c 100644
+--- a/openpgp-ca-lib/tests/test_gpg.rs
++++ b/openpgp-ca-lib/tests/test_gpg.rs
+@@ -49,8 +49,15 @@ fn test_alice_authenticates_bob_centralized(gpg: Ctx, ca: Oca) -> Result<()> {
+     // ---- use OpenPGP CA to make a set of keys ----
+ 
+     // make CA users
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
+-    ca.user_new(Some("Bob"), &["bob@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
++    ca.user_new(Some("Bob"), &["bob@example.org"], None, false, false, None)?;
+ 
+     // ---- import keys from OpenPGP CA into GnuPG ----
+ 
+@@ -275,16 +282,23 @@ fn test_bridge(gpg: Ctx, ca1: Oca, ca2: Oca) -> Result<()> {
+ 
+     // make CA user
+     assert!(ca1
+-        .user_new(Some("Alice"), &["alice@some.org"], None, false, false)
++        .user_new(Some("Alice"), &["alice@some.org"], None, false, false, None,)
+         .is_ok());
+ 
+     // ---- populate second OpenPGP CA instance ----
+ 
+     // make CA user
+-    ca2.user_new(Some("Bob"), &["bob@other.org"], None, false, false)?;
++    ca2.user_new(Some("Bob"), &["bob@other.org"], None, false, false, None)?;
+ 
+     // make CA user that is out of the domain scope for ca2
+-    ca2.user_new(Some("Carol"), &["carol@third.org"], None, false, false)?;
++    ca2.user_new(
++        Some("Carol"),
++        &["carol@third.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     // ---- setup bridges: scoped trust between one.org and two.org ---
+     let home_path = String::from(gpg.get_homedir().to_str().unwrap());
+@@ -420,10 +434,24 @@ fn test_multi_bridge(gpg: Ctx, ca1: Oca, ca2: Oca, ca3: Oca) -> Result<()> {
+     // gpg.leak_tempdir();
+ 
+     // ---- populate OpenPGP CA instances ----
+-    ca1.user_new(Some("Alice"), &["alice@alpha.org"], None, false, false)?;
++    ca1.user_new(
++        Some("Alice"),
++        &["alice@alpha.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+-    ca3.user_new(Some("Carol"), &["carol@gamma.org"], None, false, false)?;
+-    ca3.user_new(Some("Bob"), &["bob@beta.org"], None, false, false)?;
++    ca3.user_new(
++        Some("Carol"),
++        &["carol@gamma.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
++    ca3.user_new(Some("Bob"), &["bob@beta.org"], None, false, false, None)?;
+ 
+     // ---- set up bridges: scoped trust between alpha<->beta and beta<->gamma ---
+     let home_path = String::from(gpg.get_homedir().to_str().unwrap());
+@@ -561,9 +589,16 @@ fn test_scoping(gpg: Ctx, ca1: Oca, ca2: Oca, ca3: Oca) -> Result<()> {
+     let home_path = String::from(gpg.get_homedir().to_str().unwrap());
+ 
+     // ---- populate OpenPGP CA instances ----
+-    ca1.user_new(Some("Alice"), &["alice@alpha.org"], None, false, false)?;
++    ca1.user_new(
++        Some("Alice"),
++        &["alice@alpha.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+-    ca3.user_new(Some("Bob"), &["bob@beta.org"], None, false, false)?;
++    ca3.user_new(Some("Bob"), &["bob@beta.org"], None, false, false, None)?;
+     let ca3_file = format!("{home_path}/ca3.pubkey");
+     let pub_ca3 = ca3.ca_get_pubkey_armored()?;
+     std::fs::write(&ca3_file, pub_ca3).expect("Unable to write file");
+diff --git a/openpgp-ca-lib/tests/test_oca.rs b/openpgp-ca-lib/tests/test_oca.rs
+index b55ac21..5952c90 100644
+--- a/openpgp-ca-lib/tests/test_oca.rs
++++ b/openpgp-ca-lib/tests/test_oca.rs
+@@ -55,7 +55,14 @@ fn test_ca_card() -> Result<()> {
+ /// visible via CA API.
+ fn test_ca(ca: Oca) -> Result<()> {
+     // make CA user
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+ 
+@@ -125,6 +132,7 @@ fn test_expiring_certification(ca: Oca) -> Result<()> {
+         Some(365),
+         false,
+         false,
++        None,
+     )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+@@ -374,10 +382,24 @@ fn test_ca_insert_duplicate_email(ca: Oca) -> Result<()> {
+     // (e.g. "normal cert" vs "code signing cert")
+ 
+     // make CA user
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     // make another CA user with the same email address
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+ 
+@@ -528,7 +550,14 @@ fn test_ca_signatures(gpg: Ctx, ca: Oca) -> Result<()> {
+ 
+     // create carol, CA will sign carol's key.
+     // also, CA key gets a tsig by carol
+-    ca.user_new(Some("Carol"), &["carol@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Carol"),
++        &["carol@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     for user in ca.users_get_all()? {
+         let certs = ca.get_certs_by_user(&user)?;
+@@ -588,7 +617,14 @@ fn test_apply_revocation_card() -> Result<()> {
+ /// Check that the revocation has been published to the user's cert.
+ fn test_apply_revocation(ca: Oca) -> Result<()> {
+     // make CA user
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+ 
+@@ -725,7 +761,14 @@ fn test_revocation_no_fingerprint(gpg: Ctx, ca: Oca) -> Result<()> {
+     // create two different revocation certificates for one key and import them
+ 
+     // create Alice
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     // gpg: make key for Bob
+     gpg.create_user("Bob <bob@example.org>");
+@@ -862,7 +905,14 @@ fn test_create_user_with_pw_card() -> Result<()> {
+ /// encrypted user key)
+ fn test_create_user_with_pw(ca: Oca) -> Result<()> {
+     // make CA user
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, true, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        true,
++        false,
++        None,
++    )?;
+ 
+     let certs = ca.user_certs_get_all()?;
+     assert_eq!(certs.len(), 1);
+@@ -908,10 +958,38 @@ fn test_refresh(ca: Oca) -> Result<()> {
+     let ca_fp = ca_cert.fingerprint();
+ 
+     // make CA user
+-    ca.user_new(Some("Alice"), &["alice@example.org"], Some(10), true, false)?;
+-    ca.user_new(Some("Bob"), &["bob@example.org"], Some(365), true, false)?;
+-    ca.user_new(Some("Carol"), &["carol@example.org"], None, true, false)?;
+-    ca.user_new(Some("Dave"), &["dave@example.org"], Some(10), true, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        Some(10),
++        true,
++        false,
++        None,
++    )?;
++    ca.user_new(
++        Some("Bob"),
++        &["bob@example.org"],
++        Some(365),
++        true,
++        false,
++        None,
++    )?;
++    ca.user_new(
++        Some("Carol"),
++        &["carol@example.org"],
++        None,
++        true,
++        false,
++        None,
++    )?;
++    ca.user_new(
++        Some("Dave"),
++        &["dave@example.org"],
++        Some(10),
++        true,
++        false,
++        None,
++    )?;
+ 
+     // set dave to "inactive"
+     let cert = ca.certs_by_email("dave@example.org")?;
+@@ -1002,7 +1080,14 @@ fn test_ca_re_certify_card() -> Result<()> {
+ /// Re-certify with the new CA, check that certifications exist as expected
+ fn test_ca_re_certify(gpg: Ctx, ca1: Oca) -> Result<()> {
+     // make CA user (certified by the CA)
+-    ca1.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca1.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+ 
+     let (bob, _rev) = CertBuilder::new()
+         .add_userid("Bob Baker <bob@example.org>")
+diff --git a/openpgp-ca-lib/tests/test_split.rs b/openpgp-ca-lib/tests/test_split.rs
+index a930b7c..9da5511 100644
+--- a/openpgp-ca-lib/tests/test_split.rs
++++ b/openpgp-ca-lib/tests/test_split.rs
+@@ -65,7 +65,7 @@ fn split_certify(ca: Oca) -> Result<()> {
+     let back = Oca::open(back_path.to_str())?;
+ 
+     // Make user on online ca
+-    front.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    front.user_new(Some("Alice"), &["alice@example.org"], None, false, false, None)?;
+ 
+     let certs = front.user_certs_get_all()?;
+     assert_eq!(certs.len(), 1);
+diff --git a/openpgp-ca-lib/tests/wkd.rs b/openpgp-ca-lib/tests/wkd.rs
+index 34ba8b1..aa925a9 100644
+--- a/openpgp-ca-lib/tests/wkd.rs
++++ b/openpgp-ca-lib/tests/wkd.rs
+@@ -34,15 +34,30 @@ fn test_ca_export_wkd() -> Result<()> {
+     let cau = Uninit::new(Some(&db))?;
+     let ca = cau.init_softkey("example.org", None)?;
+ 
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, false, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        false,
++        false,
++        None,
++    )?;
+     ca.user_new(
+         Some("Bob"),
+         &["bob@example.org", "bob@other.org"],
+         None,
+         false,
+         false,
++        None,
++    )?;
++    ca.user_new(
++        Some("Carol"),
++        &["carol@other.org"],
++        None,
++        false,
++        false,
++        None,
+     )?;
+-    ca.user_new(Some("Carol"), &["carol@other.org"], None, false, false)?;
+ 
+     let wkd_dir = home_path + "/wkd/";
+     let wkd_path = Path::new(&wkd_dir);
+@@ -98,8 +113,15 @@ fn test_wkd_delist() -> Result<()> {
+     let ca = cau.init_softkey("example.org", None)?;
+ 
+     // make CA users
+-    ca.user_new(Some("Alice"), &["alice@example.org"], None, true, false)?;
+-    ca.user_new(Some("Bob"), &["bob@example.org"], None, true, false)?;
++    ca.user_new(
++        Some("Alice"),
++        &["alice@example.org"],
++        None,
++        true,
++        false,
++        None,
++    )?;
++    ca.user_new(Some("Bob"), &["bob@example.org"], None, true, false, None)?;
+ 
+     // set bob to "delisted"
+     let cert = ca.certs_by_email("bob@example.org")?;
+-- 
+2.43.0
+

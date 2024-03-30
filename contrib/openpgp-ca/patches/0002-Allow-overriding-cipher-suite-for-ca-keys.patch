@@ -1,0 +1,636 @@
+From 74812f487cde38257b1aa0c25bb664e8a1c46a15 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Christian=20Gr=C3=BCnhage?=
+ <jan.christian@gruenhage.xyz>
+Date: Wed, 22 Feb 2023 21:37:37 +0100
+Subject: [PATCH 2/4] Allow overriding cipher suite for ca keys
+
+---
+ openpgp-ca-bin/src/bin.rs            | 13 ++++--
+ openpgp-ca-bin/src/cli.rs            |  3 ++
+ openpgp-ca-lib/src/lib.rs            | 14 ++++--
+ openpgp-ca-lib/src/pgp.rs            |  8 +++-
+ openpgp-ca-lib/tests/card.rs         |  7 +--
+ openpgp-ca-lib/tests/test_gpg.rs     | 40 ++++++++---------
+ openpgp-ca-lib/tests/test_oca.rs     | 64 ++++++++++++++++------------
+ openpgp-ca-lib/tests/test_split.rs   | 10 ++---
+ openpgp-ca-lib/tests/wkd.rs          |  6 +--
+ openpgp-ca-restd/tests/test_restd.rs |  2 +-
+ 10 files changed, 98 insertions(+), 69 deletions(-)
+
+diff --git a/openpgp-ca-bin/src/bin.rs b/openpgp-ca-bin/src/bin.rs
+index d26f648..0c1e04f 100644
+--- a/openpgp-ca-bin/src/bin.rs
++++ b/openpgp-ca-bin/src/bin.rs
+@@ -67,13 +67,16 @@ fn main() -> Result<()> {
+                 domain,
+                 name,
+                 backend,
++                cipher_suite,
+             },
+     } = &c.cmd
+     {
+         let cau = Uninit::new(db)?;
+ 
+         let ca = match backend {
+-            cli::Backend::Softkey => cau.init_softkey(domain, name.as_deref()),
++            cli::Backend::Softkey => {
++                cau.init_softkey(domain, name.as_deref(), cipher_suite.clone())
++            }
+             cli::Backend::Card {
+                 ident,
+                 pinpad,
+@@ -99,8 +102,12 @@ fn main() -> Result<()> {
+                         println!("Initializing OpenPGP CA on card {ident}.");
+                         println!();
+ 
+-                        let (ca, key) =
+-                            cau.init_card_generate_on_host(&ident, domain, name.as_deref())?;
++                        let (ca, key) = cau.init_card_generate_on_host(
++                            &ident,
++                            domain,
++                            name.as_deref(),
++                            cipher_suite.clone(),
++                        )?;
+ 
+                         println!("Generated new CA key:\n\n{key}");
+ 
+diff --git a/openpgp-ca-bin/src/cli.rs b/openpgp-ca-bin/src/cli.rs
+index 2bcf648..acb851e 100644
+--- a/openpgp-ca-bin/src/cli.rs
++++ b/openpgp-ca-bin/src/cli.rs
+@@ -171,6 +171,9 @@ pub enum CaCommand {
+         #[clap(short = 'n', long = "name", help = "Descriptive User Name")]
+         name: Option<String>,
+ 
++        #[clap(long = "cipher-suite", help = "Set cipher suite")]
++        cipher_suite: Option<CipherSuite>,
++
+         #[clap(subcommand)]
+         backend: Backend,
+     },
+diff --git a/openpgp-ca-lib/src/lib.rs b/openpgp-ca-lib/src/lib.rs
+index cbf5bfe..1a6ec01 100644
+--- a/openpgp-ca-lib/src/lib.rs
++++ b/openpgp-ca-lib/src/lib.rs
+@@ -22,7 +22,7 @@
+ //!
+ //! // Initialize the CA, create the CA key (with domain name and descriptive name)
+ //! let ca = ca_uninit
+-//!     .init_softkey("example.org", Some("Example Org OpenPGP CA Key"))
++//!     .init_softkey("example.org", Some("Example Org OpenPGP CA Key"), None)
+ //!     .unwrap();
+ //!
+ //! // Create a new user, certified by the CA, and a trust signature by the user
+@@ -185,9 +185,14 @@ impl Uninit {
+     ///
+     /// `domainname` is the domain that this CA Admin is in charge of,
+     /// `name` is a descriptive name for the CA Admin
+-    pub fn init_softkey(self, domainname: &str, name: Option<&str>) -> Result<Oca> {
++    pub fn init_softkey(
++        self,
++        domainname: &str,
++        name: Option<&str>,
++        cipher_suite: Option<CipherSuite>,
++    ) -> Result<Oca> {
+         Self::check_domainname(domainname)?;
+-        let (cert, _) = pgp::make_ca_cert(domainname, name)?;
++        let (cert, _) = pgp::make_ca_cert(domainname, name, cipher_suite)?;
+ 
+         self.storage
+             .transaction(|| self.storage.ca_init_softkey(domainname, &cert))?;
+@@ -232,6 +237,7 @@ impl Uninit {
+         ident: &str,
+         domain: &str,
+         name: Option<&str>,
++        cipher_suite: Option<CipherSuite>,
+     ) -> Result<(Oca, String)> {
+         // The CA database must be uninitialized!
+         if self.storage.is_ca_initialized()? {
+@@ -239,7 +245,7 @@ impl Uninit {
+         }
+ 
+         // Generate a new CA private key
+-        let (ca_key, _) = pgp::make_ca_cert(domain, name)?;
++        let (ca_key, _) = pgp::make_ca_cert(domain, name, cipher_suite)?;
+ 
+         // Import key material to card.
+         let user_pin = card::import_to_card(ident, &ca_key)?;
+diff --git a/openpgp-ca-lib/src/pgp.rs b/openpgp-ca-lib/src/pgp.rs
+index 3de6426..653c98a 100644
+--- a/openpgp-ca-lib/src/pgp.rs
++++ b/openpgp-ca-lib/src/pgp.rs
+@@ -84,12 +84,16 @@ pub(crate) fn add_ca_domain_notation(
+ ///
+ /// `name` is an optional additional identifier that is added to the
+ /// UserID, if it is supplied.
+-pub(crate) fn make_ca_cert(domain: &str, name: Option<&str>) -> Result<(Cert, Signature)> {
++pub(crate) fn make_ca_cert(
++    domain: &str,
++    name: Option<&str>,
++    cipher_suite: Option<CipherSuite>,
++) -> Result<(Cert, Signature)> {
+     // Generate key for a new CA
+     let (mut ca_key, revocation) = cert::CertBuilder::new()
+         // RHEL7 [eol 2026] is shipped with GnuPG 2.0.x, which doesn't
+         // support ECC
+-        .set_cipher_suite(CipherSuite::RSA4k.into())
++        .set_cipher_suite(cipher_suite.unwrap_or(CipherSuite::RSA4k).into())
+         .add_signing_subkey()
+         // FIXME: set expiration from CLI
+         // .set_validity_period()
+diff --git a/openpgp-ca-lib/tests/card.rs b/openpgp-ca-lib/tests/card.rs
+index d7db0a7..b6123a6 100644
+--- a/openpgp-ca-lib/tests/card.rs
++++ b/openpgp-ca-lib/tests/card.rs
+@@ -78,7 +78,7 @@ fn init_card_import_key() -> Result<()> {
+     assert!(ca_path.to_str().is_some());
+ 
+     let cau_old = Uninit::new(ca_path.to_str())?;
+-    let _ca_old = cau_old.init_softkey("example.org", None)?;
++    let _ca_old = cau_old.init_softkey("example.org", None, None)?;
+ 
+     // Retrieve the "old" CA key
+     let sqlite = Connection::open(ca_path)?;
+@@ -141,7 +141,8 @@ fn init_card_import_card() -> Result<()> {
+     assert!(ca_path.to_str().is_some());
+ 
+     let cau_old = Uninit::new(ca_path.to_str())?;
+-    let (ca_old, _ca_private) = cau_old.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca_old, _ca_private) =
++        cau_old.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     let ca_pub = ca_old.ca_get_cert_pub()?;
+ 
+@@ -216,7 +217,7 @@ fn card_import_migrate() -> Result<()> {
+         // Set up "pre-existing" softkey CA instance
+ 
+         let cau_old = Uninit::new(ca_path.to_str())?;
+-        let ca_old = cau_old.init_softkey("example.org", None)?;
++        let ca_old = cau_old.init_softkey("example.org", None, None)?;
+ 
+         ca_old.user_new(
+             Some("Alice"),
+diff --git a/openpgp-ca-lib/tests/test_gpg.rs b/openpgp-ca-lib/tests/test_gpg.rs
+index 471aa3c..cb51a2f 100644
+--- a/openpgp-ca-lib/tests/test_gpg.rs
++++ b/openpgp-ca-lib/tests/test_gpg.rs
+@@ -22,7 +22,7 @@ fn alice_authenticates_bob_centralized_soft() -> Result<()> {
+     let (gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_alice_authenticates_bob_centralized(gpg, ca)
+ }
+@@ -34,7 +34,7 @@ fn alice_authenticates_bob_centralized_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_alice_authenticates_bob_centralized(gpg, ca)
+ }
+@@ -111,7 +111,7 @@ fn test_alice_authenticates_bob_decentralized_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_alice_authenticates_bob_decentralized(ca)
+ }
+@@ -123,7 +123,7 @@ fn test_alice_authenticates_bob_decentralized_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (_gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_alice_authenticates_bob_decentralized(ca)
+ }
+@@ -238,10 +238,10 @@ fn test_bridge_soft() -> Result<()> {
+     let (gpg, ca1u, ca2u) = util::setup_two_uninit()?;
+ 
+     // make new CA key
+-    let ca1 = ca1u.init_softkey("some.org", None)?;
++    let ca1 = ca1u.init_softkey("some.org", None, None)?;
+ 
+     // make new CA key
+-    let ca2 = ca2u.init_softkey("other.org", None)?;
++    let ca2 = ca2u.init_softkey("other.org", None, None)?;
+ 
+     test_bridge(gpg, ca1, ca2)
+ }
+@@ -255,10 +255,10 @@ fn test_bridge_card() -> Result<()> {
+     let (gpg, ca1u, ca2u) = util::setup_two_uninit()?;
+ 
+     // CA1 lives on the card
+-    let (ca1, _priv) = ca1u.init_card_generate_on_host(&ident, "some.org", None)?;
++    let (ca1, _priv) = ca1u.init_card_generate_on_host(&ident, "some.org", None, None)?;
+ 
+     // CA2 is a softkey instance
+-    let ca2 = ca2u.init_softkey("other.org", None)?;
++    let ca2 = ca2u.init_softkey("other.org", None, None)?;
+ 
+     test_bridge(gpg, ca1, ca2)
+ }
+@@ -397,9 +397,9 @@ fn test_multi_bridge_soft() -> Result<()> {
+     let (gpg, ca1u, ca2u, ca3u) = util::setup_three_uninit()?;
+ 
+     // make new CA keys
+-    let ca1 = ca1u.init_softkey("alpha.org", None)?;
+-    let ca2 = ca2u.init_softkey("beta.org", None)?;
+-    let ca3 = ca3u.init_softkey("gamma.org", None)?;
++    let ca1 = ca1u.init_softkey("alpha.org", None, None)?;
++    let ca2 = ca2u.init_softkey("beta.org", None, None)?;
++    let ca3 = ca3u.init_softkey("gamma.org", None, None)?;
+ 
+     test_multi_bridge(gpg, ca1, ca2, ca3)
+ }
+@@ -413,9 +413,9 @@ fn test_multi_bridge_card() -> Result<()> {
+     let (gpg, ca1u, ca2u, ca3u) = util::setup_three_uninit()?;
+ 
+     // CA3 is card-backed, CA1 and CA2 are softkey instances
+-    let ca1 = ca1u.init_softkey("alpha.org", None)?;
+-    let ca2 = ca2u.init_softkey("beta.org", None)?;
+-    let (ca3, _priv) = ca3u.init_card_generate_on_host(&ident, "gamma.org", None)?;
++    let ca1 = ca1u.init_softkey("alpha.org", None, None)?;
++    let ca2 = ca2u.init_softkey("beta.org", None, None)?;
++    let (ca3, _priv) = ca3u.init_card_generate_on_host(&ident, "gamma.org", None, None)?;
+ 
+     test_multi_bridge(gpg, ca1, ca2, ca3)
+ }
+@@ -555,9 +555,9 @@ fn test_scoping_soft() -> Result<()> {
+     let (gpg, ca1u, ca2u, ca3u) = util::setup_three_uninit()?;
+ 
+     // make new CA keys
+-    let ca1 = ca1u.init_softkey("alpha.org", None)?;
+-    let ca2 = ca2u.init_softkey("beta.org", None)?;
+-    let ca3 = ca3u.init_softkey("other.org", None)?;
++    let ca1 = ca1u.init_softkey("alpha.org", None, None)?;
++    let ca2 = ca2u.init_softkey("beta.org", None, None)?;
++    let ca3 = ca3u.init_softkey("other.org", None, None)?;
+ 
+     test_scoping(gpg, ca1, ca2, ca3)
+ }
+@@ -571,9 +571,9 @@ fn test_scoping_card() -> Result<()> {
+     let (gpg, ca1u, ca2u, ca3u) = util::setup_three_uninit()?;
+ 
+     // CA3 is card-backed, CA1 and CA2 are softkey instances
+-    let ca1 = ca1u.init_softkey("alpha.org", None)?;
+-    let ca2 = ca2u.init_softkey("beta.org", None)?;
+-    let (ca3, _priv) = ca3u.init_card_generate_on_host(&ident, "other.org", None)?;
++    let ca1 = ca1u.init_softkey("alpha.org", None, None)?;
++    let ca2 = ca2u.init_softkey("beta.org", None, None)?;
++    let (ca3, _priv) = ca3u.init_card_generate_on_host(&ident, "other.org", None, None)?;
+ 
+     test_scoping(gpg, ca1, ca2, ca3)
+ }
+diff --git a/openpgp-ca-lib/tests/test_oca.rs b/openpgp-ca-lib/tests/test_oca.rs
+index 5952c90..e9e4f04 100644
+--- a/openpgp-ca-lib/tests/test_oca.rs
++++ b/openpgp-ca-lib/tests/test_oca.rs
+@@ -31,7 +31,7 @@ fn test_ca_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", Some("Example Org OpenPGP CA Key"))?;
++    let ca = cau.init_softkey("example.org", Some("Example Org OpenPGP CA Key"), None)?;
+ 
+     test_ca(ca)
+ }
+@@ -43,8 +43,12 @@ fn test_ca_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (_gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) =
+-        cau.init_card_generate_on_host(&ident, "example.org", Some("Example Org OpenPGP CA Key"))?;
++    let (ca, _priv) = cau.init_card_generate_on_host(
++        &ident,
++        "example.org",
++        Some("Example Org OpenPGP CA Key"),
++        None,
++    )?;
+ 
+     test_ca(ca)
+ }
+@@ -99,7 +103,7 @@ fn test_expiring_certification_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", Some("Example Org OpenPGP CA Key"))?;
++    let ca = cau.init_softkey("example.org", Some("Example Org OpenPGP CA Key"), None)?;
+ 
+     test_expiring_certification(ca)
+ }
+@@ -111,8 +115,12 @@ fn test_expiring_certification_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (_gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) =
+-        cau.init_card_generate_on_host(&ident, "example.org", Some("Example Org OpenPGP CA Key"))?;
++    let (ca, _priv) = cau.init_card_generate_on_host(
++        &ident,
++        "example.org",
++        Some("Example Org OpenPGP CA Key"),
++        None,
++    )?;
+ 
+     test_expiring_certification(ca)
+ }
+@@ -176,7 +184,7 @@ fn test_update_cert_key_soft() -> Result<()> {
+     let (gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_update_cert_key(gpg, ca)
+ }
+@@ -188,7 +196,7 @@ fn test_update_cert_key_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_update_cert_key(gpg, ca)
+ }
+@@ -286,7 +294,7 @@ fn test_ca_import_soft() -> Result<()> {
+     let (gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_ca_import(gpg, ca)
+ }
+@@ -298,7 +306,7 @@ fn test_ca_import_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_ca_import(gpg, ca)
+ }
+@@ -357,7 +365,7 @@ fn test_ca_insert_duplicate_email_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_ca_insert_duplicate_email(ca)
+ }
+@@ -369,7 +377,7 @@ fn test_ca_insert_duplicate_email_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (_gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_ca_insert_duplicate_email(ca)
+ }
+@@ -420,7 +428,7 @@ fn test_ca_multiple_revocations_soft() -> Result<()> {
+     let (gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_ca_multiple_revocations(gpg, ca)
+ }
+@@ -432,7 +440,7 @@ fn test_ca_multiple_revocations_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_ca_multiple_revocations(gpg, ca)
+ }
+@@ -497,7 +505,7 @@ fn test_ca_signatures_soft() -> Result<()> {
+     let (gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_ca_signatures(gpg, ca)
+ }
+@@ -509,7 +517,7 @@ fn test_ca_signatures_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_ca_signatures(gpg, ca)
+ }
+@@ -595,7 +603,7 @@ fn test_apply_revocation_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_apply_revocation(ca)
+ }
+@@ -607,7 +615,7 @@ fn test_apply_revocation_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (_gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_apply_revocation(ca)
+ }
+@@ -662,7 +670,7 @@ fn test_import_signed_cert() -> Result<()> {
+     let db = format!("{home_path}/ca.sqlite");
+ 
+     let cau = Uninit::new(Some(&db))?;
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     // import CA key into GnuPG
+     let sqlite = Connection::open(db)?;
+@@ -732,7 +740,7 @@ fn test_revocation_no_fingerprint_soft() -> Result<()> {
+     let (gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_revocation_no_fingerprint(gpg, ca)
+ }
+@@ -744,7 +752,7 @@ fn test_revocation_no_fingerprint_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_revocation_no_fingerprint(gpg, ca)
+ }
+@@ -882,7 +890,7 @@ fn test_create_user_with_pw_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_create_user_with_pw(ca)
+ }
+@@ -894,7 +902,7 @@ fn test_create_user_with_pw_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (_gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_create_user_with_pw(ca)
+ }
+@@ -932,7 +940,7 @@ fn test_refresh_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     test_refresh(ca)
+ }
+@@ -944,7 +952,7 @@ fn test_refresh_card() -> Result<()> {
+     util::reset_card(&ident)?;
+ 
+     let (_gpg, cau) = util::setup_one_uninit()?;
+-    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _priv) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     test_refresh(ca)
+ }
+@@ -1056,7 +1064,7 @@ fn test_ca_re_certify_soft() -> Result<()> {
+     let (gpg, cau) = util::setup_one_uninit()?;
+ 
+     // make new CA key
+-    let ca = cau.init_softkey("example.org", Some("example.org CA old"))?;
++    let ca = cau.init_softkey("example.org", Some("example.org CA old"), None)?;
+ 
+     test_ca_re_certify(gpg, ca)
+ }
+@@ -1069,7 +1077,7 @@ fn test_ca_re_certify_card() -> Result<()> {
+ 
+     let (gpg, cau) = util::setup_one_uninit()?;
+     let (ca, _priv) =
+-        cau.init_card_generate_on_host(&ident, "example.org", Some("example.org CA old"))?;
++        cau.init_card_generate_on_host(&ident, "example.org", Some("example.org CA old"), None)?;
+ 
+     test_ca_re_certify(gpg, ca)
+ }
+@@ -1102,7 +1110,7 @@ fn test_ca_re_certify(gpg: Ctx, ca1: Oca) -> Result<()> {
+     let home_path = String::from(gpg.get_homedir().to_str().unwrap());
+     let db2 = format!("{home_path}/ca2.sqlite");
+     let ca2u = Uninit::new(Some(&db2))?;
+-    let ca2 = ca2u.init_softkey("example.org", Some("example.org CA new"))?;
++    let ca2 = ca2u.init_softkey("example.org", Some("example.org CA new"), None)?;
+ 
+     // import certs from old CA, without certifying anything
+     for cert in ca1.user_certs_get_all()? {
+diff --git a/openpgp-ca-lib/tests/test_split.rs b/openpgp-ca-lib/tests/test_split.rs
+index 9da5511..a34d100 100644
+--- a/openpgp-ca-lib/tests/test_split.rs
++++ b/openpgp-ca-lib/tests/test_split.rs
+@@ -19,7 +19,7 @@ fn split_certify_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // Make new softkey CA
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     split_certify(ca)
+ }
+@@ -33,7 +33,7 @@ fn split_certify_card() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // Make new card-based CA
+-    let (ca, _privkey) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _privkey) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     split_certify(ca)
+ }
+@@ -100,7 +100,7 @@ fn split_add_bridge_soft() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // Make new softkey CA
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     split_add_bridge(ca)
+ }
+@@ -114,7 +114,7 @@ fn split_add_bridge_card() -> Result<()> {
+     let (_gpg, cau) = util::setup_one_uninit()?;
+ 
+     // Make new card-based CA
+-    let (ca, _privkey) = cau.init_card_generate_on_host(&ident, "example.org", None)?;
++    let (ca, _privkey) = cau.init_card_generate_on_host(&ident, "example.org", None, None)?;
+ 
+     split_add_bridge(ca)
+ }
+@@ -138,7 +138,7 @@ fn split_add_bridge(ca1: Oca) -> Result<()> {
+ 
+     // Make new "remote" softkey CA
+     let (gpg, cau2) = util::setup_one_uninit()?;
+-    let ca2 = cau2.init_softkey("remote.example", None)?;
++    let ca2 = cau2.init_softkey("remote.example", None, None)?;
+ 
+     // Split softkey CA into back and front instances
+     let mut front_path = tmp_path.clone();
+diff --git a/openpgp-ca-lib/tests/wkd.rs b/openpgp-ca-lib/tests/wkd.rs
+index aa925a9..bc28a79 100644
+--- a/openpgp-ca-lib/tests/wkd.rs
++++ b/openpgp-ca-lib/tests/wkd.rs
+@@ -32,7 +32,7 @@ fn test_ca_export_wkd() -> Result<()> {
+     let db = format!("{home_path}/ca.sqlite");
+ 
+     let cau = Uninit::new(Some(&db))?;
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     ca.user_new(
+         Some("Alice"),
+@@ -110,7 +110,7 @@ fn test_wkd_delist() -> Result<()> {
+     let db = format!("{home_path}/ca.sqlite");
+ 
+     let cau = Uninit::new(Some(&db))?;
+-    let ca = cau.init_softkey("example.org", None)?;
++    let ca = cau.init_softkey("example.org", None, None)?;
+ 
+     // make CA users
+     ca.user_new(
+@@ -200,7 +200,7 @@ fn test_ca_export_wkd_sequoia() -> Result<()> {
+     let db = format!("{home_path}/ca.sqlite");
+ 
+     let cau = Uninit::new(Some(&db))?;
+-    let ca = cau.init_softkey("sequoia-pgp.org", None)?;
++    let ca = cau.init_softkey("sequoia-pgp.org", None, None)?;
+ 
+     ca.cert_import_new(
+         justus_key.as_bytes(),
+diff --git a/openpgp-ca-restd/tests/test_restd.rs b/openpgp-ca-restd/tests/test_restd.rs
+index 86b62ea..6693bcd 100644
+--- a/openpgp-ca-restd/tests/test_restd.rs
++++ b/openpgp-ca-restd/tests/test_restd.rs
+@@ -234,7 +234,7 @@ async fn test_restd() {
+ 
+     // -- init OpenPGP CA --
+     let cau = Uninit::new(Some(&db)).unwrap();
+-    let _ca = cau.init_softkey("example.org", None).unwrap();
++    let _ca = cau.init_softkey("example.org", None, None).unwrap();
+ 
+     // -- start restd --
+     let abort_handle = start_restd(db);
+-- 
+2.43.0
+
